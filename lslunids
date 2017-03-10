@@ -1,0 +1,255 @@
+#!/bin/ksh
+###############################################################################
+#
+#@(#) Function : Get LUNs information
+#
+#@(#) File     : lslunids
+#@(#) Syntax   : lslunids
+#@(#) Version  : 1.2
+#@(#) Author   : Wiktor L
+#
+# ----------------------------------------------------------------------------
+# Revision History:
+#-----------------------------------------------------------------------------
+# Date          Ver           Description
+# ----------------------------------------------------------------------------
+# 29/05/2013    0.1           Script creation
+# 05/06/2013    0.2           bootinfo added if getconf not working
+# 10/10/2013    0.3           EMC support
+# 28/02/2014    0.4           Added more storages
+# 13/03/2014    0.5           Added XIV storage support
+# 04/06/2014    0.6           Added SYMMETRIX storage support
+# 10/12/2014    0.7           Set LANG to C, to avoid problems with languages
+# 17/12/2014    0.8           added parameters to script
+#                             change name from Extract_Storage_Info.ksh to lslunids
+# 12/01/2015    0.9           Small bugs corrected
+# 18/01/2015    1.0           Added SN to report
+# 16/07/2016    1.13          Added FlashSystem support
+# 01/09/2016    1.14          Fixed small bugs
+# 22/09/2016    1.15          Removed support for AIX lower then 5.3 and improve storage function.
+# 10/01/2017    1.16          Added PVID to display
+# 11/01/2017    1.2           Added mirror pools to display
+# ----------------------------------------------------------------------------
+# Summary of return codes :
+#
+#@(#) RC=0      : Everything gone well
+#
+###############################################################################
+
+VERSION="1.2"
+
+[ ! "$(uname)" = "AIX" ] && { echo "Sorry, $(uname) is not supported, this version is only for AIX." >&2; exit 1; }
+[ "$(oslevel | tr -d '.')" -lt '5300' ] && { echo "Sorry, $(oslevel) is not supported, only AIX 5.3 or greater is" >&2; exit 1; }
+
+export ODMDIR=/etc/objrepos
+unset LANG LC_ALL
+export LANG=C
+SCRIPTNAME=$0
+OS=$(oslevel | tr -d '.')
+HOSTNAME=$(uname -n)
+
+HELP() {
+   cat <<EOF
+Usage: $SCRIPTNAME [-c] [-m] [-r] [-d] [-h]
+   -c : csv output
+   -m : display mirrorpools also
+   -r : csv report output with hostname, sn and building
+   -d : debug mode
+   -v : Print version.
+   -h : displays basic help
+EOF
+   exit 0
+}
+
+while getopts ":cmrdvh" ARG; do
+    case "${ARG}" in
+     c )  CSV=YES ;;
+     m )  MP_DISP=YES ;;
+     r )  REPORT=YES ;;
+     d )  DEBUG_MODE=YES ;;
+     v )  echo "Version : $VERSION" & exit 0 ;;
+     h )  HELP ;;
+    esac
+done
+
+shift $(($OPTIND - 1))
+
+# Set default variables 
+CSV=${CSV:-NO}
+REPORT=${REPORT:-NO}
+DEBUG_MODE=${DEBUG_MODE:-NO}
+MP_DISP=${MP_DISP:-NO}
+
+[ "${DEBUG_MODE}" = "YES" ] && set -x
+
+function storage
+{
+
+STO_SN=$1
+
+  case $STO_SN in
+#DS
+        75YYYY) STO_SN_NAME=DS8700_01;;
+        75XXXX) STO_SN_NAME=DS8700_02;;
+
+#SVC
+        60050XXXXXXXXXXXXXXXXXXXX) STO_SN_NAME=SVC_01;;
+        60050XXXXXXXXXXXXXXXXXXXX) STO_SN_NAME=SVC_02;;      
+#
+#        *) STO_SN_NAME=${STO_SN};;
+#
+  esac
+}
+
+SERIAL=$(lsattr -El sys0 -a systemid -Fvalue | cut -c 7-)
+case $SERIAL in
+        06XXXX) BUILDING=Paris;;
+esac
+
+if [ ${MP_DISP} = YES ]
+then
+  if [ $(lspv -P >/dev/null 2>&1 ; echo $?) = 0 ]
+  then
+    set -A lspv_P $(lspv -P | perl -i -lpe 's/\s+/;/g')
+  fi
+fi
+
+for DISK in $(lsdev -Cc disk | awk '$4 !~ /EMC/ {if (( $2 == "Available")) print $1}')
+do
+      UNIQUE_ID="" ; PVID="" ; VG="" ; SIZE="" ; STO_SN="" ; STO_TY="" ; LUN_SN="" ; LUN_ALL="" ; MIRROR_POOL="NA" 
+
+      #UNIQUE_ID=$(odmget -q "name=${DISK} and attribute=unique_id" CuAt | awk '{if (( $1 == "value" )) print $3}' | sed "s/\"//g")
+      UNIQUE_ID=$(odmget -q "name=${DISK} and attribute=unique_id" CuAt | awk -F= ' /value/ {print $2}' | sed s'/[" ]//g')
+      [ -z "$UNIQUE_ID" ] && UNIQUE_ID=$(odmget -q "name=${DISK} and attribute=sis_unique_id" CuAt | awk -F= ' /value/ {print $2}' | sed s'/[" ]//g')
+      VG=$(lspv | awk -v DISK=$DISK '{if (( $1 == DISK )) print $3}')
+      SIZE=$(getconf DISK_SIZE /dev/$DISK 2>&-)
+      [ $? != 0 ] && SIZE=$(bootinfo -s $DISK)
+      SIZEGB=$(($SIZE / 1024 ))
+      PVID=$(lspv | awk -v DISK=$DISK '{if (( $1 == DISK )) print $2}')
+      
+      if [ ${MP_DISP} = YES ]
+      then
+          MIRROR_POOL=$(printf -- '%s\n' "${lspv_P[@]}" | awk -F';' -v DISK=$DISK '{if (( $1 == DISK )) print $3}') ; [ "X${MIRROR_POOL}" = X ] && MIRROR_POOL=NA
+       fi
+
+      if [ -n "$UNIQUE_ID" ] 
+      then
+              # VSCSI
+              if [ "$(echo ${UNIQUE_ID} | tail -c 6)" = "vscsi" ]
+              then
+                      if [ "$(echo ${UNIQUE_ID} | cut -c 22-25)" = "2107" ]
+                      then
+                                      STO_TY="DS8000"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 9-15)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 16-19)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 9-19)
+                      elif  [ "$(echo ${UNIQUE_ID} | cut -c 28-34)" = "2810XIV" ]
+                      then
+                                      STO_TY="XIV"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 18-21)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 22-25)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 18-25)
+                      elif  [ "$(echo ${UNIQUE_ID} | wc -c)" -ge 47 ] && [ "$(echo ${UNIQUE_ID} | cut -c 44-47)" = "2145" ]
+                      then
+                                      STO_TY="SVC"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 10-34)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 38-41)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 10-41)
+                      elif  [ "$(echo ${UNIQUE_ID} | wc -c)" -ge 47 ] && [ "$(echo ${UNIQUE_ID} | cut -c 44-47)" = "1815" ]
+                      then
+                                      STO_TY="DS4800"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 10-25)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 38-41)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 10-41)
+                      elif  [ "$(echo ${UNIQUE_ID} | grep -q "DGCfcp" ; echo $?)" = 0 ]
+                      then
+                                      STO_TY="EMC"
+                                      STO_SN="$(echo ${UNIQUE_ID} | cut -c 10-25)"
+                                      LUN_SN="NA"
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 10-41)
+                      else
+                                      STO_TY="UNKNOW"
+                                      STO_SN="unknow_vscsi"
+                                      LUN_SN="NA"
+                                      LUN_ALL="unknow_vscsi"
+                                      STO_SN_NAME="unknow_vscsi"
+                      fi
+
+              # DIRECT FC
+              elif [ $(echo ${UNIQUE_ID} | tail -c 4) = "fcp" ]
+              then
+                      if [ "$(echo ${UNIQUE_ID} | cut -c 18-21)" = "2107" ]
+                      then
+                                      STO_TY="DS8000"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 5-11)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 12-15)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 5-15)  
+                      elif  [ "$(echo ${UNIQUE_ID} | cut -c 24-30)" = "2810XIV" ]
+                      then
+                                      STO_TY="XIV"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 14-17)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 18-21)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 14-21)
+                      elif  [ "$(echo ${UNIQUE_ID} | wc -c)" -ge 42 ] && [ "$(echo ${UNIQUE_ID} | cut -f 1 -d 'IBMfcp' | cut -c 40-43)" = "2145" ]
+                      then
+                                      STO_TY="SVC"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 6-30)
+                                      LUN_SN=$(echo ${UNIQUE_ID} | cut -c 34-37)
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 6-37)
+                      elif  [ "$(echo ${UNIQUE_ID} | grep -q 'DGCfcp'; echo $? )" = 0 ]
+                      then
+                                      STO_TY="EMC"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 6-21)
+                                      LUN_SN="NA"
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 6-37)
+                      elif  [ "$(echo ${UNIQUE_ID} | grep -q 'SYMMETRIX'; echo $? )" = 0 ]
+                      then
+                                      STO_TY="SYMMET"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 1-6)
+                                      LUN_SN="NA"
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 7-10)
+                      elif  [ "$(echo ${UNIQUE_ID} | grep -q 'FlashSystem'; echo $? )" = 0 ]
+                      then
+                                      STO_TY="FLASHS"
+                                      STO_SN=$(echo ${UNIQUE_ID} | cut -c 21-36)
+                                      LUN_SN="NA"
+                                      LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 43-53 | tr -d '-')
+                      fi
+              # INTER SAS
+              elif  [ $(echo ${UNIQUE_ID} | tail -c 5) = "scsi" ] || [ $(echo ${UNIQUE_ID}  | tail -c 4) = "sas" ] || [ $(echo ${UNIQUE_ID} | tail -c 4) = "IBM" ]
+              then
+                      STO_TY="INTER"
+                      STO_SN="NA"
+                      LUN_SN="NA"
+                      LUN_ALL=$(lscfg -vl $DISK|grep Serial|sed 's/Serial Number...............//'|tr -d '[:space:]')
+                      [ -z "$LUN_ALL" ] && LUN_ALL=$(echo ${UNIQUE_ID} | cut -c 5-12)
+                      STO_SN_NAME=$(lscfg -vl $DISK|grep 'Machine Type and Model'|sed 's/Machine Type and Model......//'|tr -d '[:space:]')
+                      [ -z "$STO_SN_NAME" ] && STO_SN_NAME=NA
+              fi
+
+            storage ${STO_SN}
+            
+            if [ ${MP_DISP} = YES ]
+            then
+			  if [ ${CSV} = YES ] ; then
+				echo "${DISK};${PVID};${MIRROR_POOL};${SIZEGB};${VG};${STO_TY};${STO_SN_NAME};${LUN_ALL};${LUN_SN}"
+			  elif [ ${REPORT} = YES ] ; then
+				echo "${HOSTNAME};${SERIAL};${BUILDING};${DISK};${PVID};${MIRROR_POOL};${SIZEGB};${VG};${STO_TY};${STO_SN_NAME};${LUN_ALL};${LUN_SN}"
+			  else
+				echo "${DISK} ${PVID} ${MIRROR_POOL} ${SIZEGB} ${VG} ${STO_TY} ${STO_SN_NAME} ${LUN_ALL} ${LUN_SN}" | awk '{ printf ("%-15s %-17s %-12s %-5s %-18s %-6s %-26s %-33s %-4s  \n",$1,$2,$3,$4,$5,$6,$7,$8,$9) }'
+			  fi
+            else
+			  if [ ${CSV} = YES ] ; then
+				echo "${DISK};${PVID};${SIZEGB};${VG};${STO_TY};${STO_SN_NAME};${LUN_ALL};${LUN_SN}"
+			  elif [ ${REPORT} = YES ] ; then
+				echo "${HOSTNAME};${SERIAL};${BUILDING};${DISK};${PVID};${SIZEGB};${VG};${STO_TY};${STO_SN_NAME};${LUN_ALL};${LUN_SN}"
+			  else
+				echo "${DISK} ${PVID} ${SIZEGB} ${VG} ${STO_TY} ${STO_SN_NAME} ${LUN_ALL} ${LUN_SN}" | awk '{ printf ("%-15s %-17s %-5s %-18s %-6s %-26s %-33s %-4s  \n",$1,$2,$3,$4,$5,$6,$7,$8) }'
+			  fi
+            fi
+
+      fi
+done
+
+exit 0
+
