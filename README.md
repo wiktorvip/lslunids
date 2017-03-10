@@ -1,1 +1,1 @@
-# lslunids
+Get LUNs information
